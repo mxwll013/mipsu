@@ -63,4 +63,4 @@ cc -std=c89 -Wall -Wextra -O2 mipsu.c -o mipsu
 
 ## License
 
-MIT license. See `LICENSE.txt` for more details.
+MIT license. See `LICENSE` for more details.
