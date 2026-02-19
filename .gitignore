@@ -1,4 +1,6 @@
 
+mips.asm
+test
 build
 mipsu
 .clang-format

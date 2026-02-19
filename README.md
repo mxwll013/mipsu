@@ -41,7 +41,7 @@ options:
 
 ### Decoding
 
-Decode instruction fields from machine code.
+Decode machine code into instruction fields.
 
 ```sh
 mipsu decode 0x00b81020
