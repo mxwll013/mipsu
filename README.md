@@ -10,11 +10,13 @@ MIPS32 utilities
 
 usage:
   mipsu decode <hex | bin>
-  mipsu disasm [hex | bin]
+  mipsu disasm <hex | bin>
+  mipsu disasm -f <file>
   mipsu encode -R <rs> <rt> <rd> <sh> <fn>
   mipsu encode -I <op> <rs> <rt> <imm>
   mipsu encode -J <op> <addr>
-  mipsu asm    [mips]
+  mipsu asm    <mips>
+  mipsu asm    -f <file>
   mipsu --version
   mipsu --help | -h
 
@@ -28,7 +30,13 @@ flags:
   -q, --quiet     minimal output
   -v, --verbose   maximal output
       --no-color  plain output
-  -n, --nreg      use register numbers
+  -n, --nreg      use numbers when formatting registers
+  -s, --strict    enable strict parsing
+
+options:
+  -o <file>, --output <file>  Specify an output file
+  -f <file>, --file   <file>  Specify an input file
+
 ```
 
 ### Decoding
