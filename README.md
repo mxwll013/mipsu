@@ -32,18 +32,22 @@ flags:
       --no-color  plain output
   -n, --nreg      use numbers when formatting registers
   -s, --strict    enable strict parsing
+      --raw       handle raw binary files
 
 options:
   -o <file>, --output <file>  Specify an output file
   -f <file>, --file   <file>  Specify an input file
-
 ```
 
 ### Decoding
 
+Decode instruction fields from machine code.
+
 ```sh
 mipsu decode 0x00b81020
 ```
+
+Output
 
 ```
 hex:  0x00B81020
@@ -58,9 +62,13 @@ fn:  0x20  (add)
 
 ### Encoding
 
+Encode instruction fields into machine code.
+
 ```sh
 mipsu encode R 0x05 0x18 0x02 0x00 0x20
 ```
+
+Output:
 
 ```
 hex:  0x00B81020
@@ -75,9 +83,13 @@ fn:  0x20  (add)
 
 ### Disassembly
 
+Disassemble machine code into human-readable assembly.
+
 ```sh
 mipsu disasm 0x00b81020
 ```
+
+Output:
 
 ```
 0x00B81020  add      $v0  , $a1  , $t8
@@ -85,12 +97,45 @@ mipsu disasm 0x00b81020
 
 ### Assembly
 
+Assemble human-readable assembly into machine code.
+
 ```sh
-mipsu asm 'add $v0 $a1 $t8'
+mipsu asm 'add $v0, $a1, $t8'
 ```
+
+Output
 
 ```
 0x00B81020  add      $v0  , $a1  , $t8
+```
+
+### Raw binary support
+
+Both `disasm` and `asm` can operate directly on raw binary files.
+
+Example assembly (`mips.asm`):
+
+```asm
+add  $v0, $a1, $t8
+addu $v0, $a1, $t8
+sub  $v0, $a1, $t8
+subu $v0, $a1, $t8
+```
+
+Assemble to raw binary and then disassemble it
+
+```sh
+mipsu asm -f mips.asm --raw -o mips.bin
+mipsu disasm --raw -f mips.bin
+```
+
+Output
+
+```
+0x00B81020  add      $v0  , $a1  , $t8
+0x00B81021  addu     $v0  , $a1  , $t8
+0x00B81022  sub      $v0  , $a1  , $t8
+0x00B81023  subu     $v0  , $a1  , $t8
 ```
 
 ## Build

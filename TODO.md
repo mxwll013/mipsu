@@ -1,11 +1,5 @@
 # mipsu TODO
 
-## 1.0.0
-
-- Raw binary support
-  - read
-  - write
-
 ## 1.0.1
 
 - Parse decimal values

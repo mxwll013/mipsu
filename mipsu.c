@@ -12,14 +12,13 @@
  * Copyright (c) 2026 mxwll013
  */
 
-#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define MIPSU_VERSION "0.0.3"
+#define MIPSU_VERSION "1.0.0"
 
 #define true  1
 #define false 0
@@ -83,6 +82,8 @@ enum mipsu_result {
     MIPSU_RESULT_MISSING_ARGS,
     MIPSU_RESULT_TOO_MANY_ARGS,
     MIPSU_RESULT_FROM_FILE,
+    MIPSU_RESULT_RAW_STDIN,
+    MIPSU_RESULT_RAW_STDOUT,
     MIPSU_RESULT_STDIN_CHAR,
 
     MIPSU_RESULT_BAD_RADIX,
@@ -103,6 +104,7 @@ enum mipsu_result {
     MIPSU_RESULT_INSTR_SIZE,
 
     MIPSU_RESULT_BUFF_OVERFLOW,
+    MIPSU_RESULT_READ_FILE,
     MIPSU_RESULT_OPEN_FILE,
 };
 
@@ -112,7 +114,10 @@ enum mipsu_flag {
     MIPSU_FLAG_NO_COLOR = 1 << 2,
     MIPSU_FLAG_NREG     = 1 << 3,
     MIPSU_FLAG_STRICT   = 1 << 4,
+    MIPSU_FLAG_RAW      = 1 << 5,
 };
+
+static const size_t mipsu_word_size = sizeof(mipsu_word_t);
 
 static const uint8_t mipsu_op_offset = 26;
 static const uint8_t mipsu_rs_offset = 21;
@@ -328,6 +333,8 @@ static const char* mipsu_res_msg_lut[] = {
     [MIPSU_RESULT_MISSING_ARGS]  = "missing argument(s)",
     [MIPSU_RESULT_TOO_MANY_ARGS] = "too many arguments",
     [MIPSU_RESULT_FROM_FILE]     = "command does not allow reading from file",
+    [MIPSU_RESULT_RAW_STDIN]     = "cannot read raw binary from stdin",
+    [MIPSU_RESULT_RAW_STDOUT]    = "cannor write raw binaray to stdout",
     [MIPSU_RESULT_STDIN_CHAR]    = "drop '-' to read from stdin",
 
     [MIPSU_RESULT_BAD_RADIX]       = "unknown radix (base)",
@@ -347,6 +354,7 @@ static const char* mipsu_res_msg_lut[] = {
     [MIPSU_RESULT_INSTR_SIZE]      = "too many instruction arguments",
 
     [MIPSU_RESULT_BUFF_OVERFLOW] = "buffer overflow",
+    [MIPSU_RESULT_READ_FILE]     = "failed to read raw binary file",
     [MIPSU_RESULT_OPEN_FILE]     = "failed to open file",
 };
 
@@ -358,6 +366,8 @@ static const mipsu_exit_t mipsu_err_lut[] = {
     [MIPSU_RESULT_MISSING_ARGS]  = MIPSU_EXIT_USAGE,
     [MIPSU_RESULT_TOO_MANY_ARGS] = MIPSU_EXIT_USAGE,
     [MIPSU_RESULT_FROM_FILE]     = MIPSU_EXIT_USAGE,
+    [MIPSU_RESULT_RAW_STDIN]     = MIPSU_EXIT_USAGE,
+    [MIPSU_RESULT_RAW_STDOUT]    = MIPSU_EXIT_USAGE,
     [MIPSU_RESULT_STDIN_CHAR]    = MIPSU_EXIT_USAGE,
 
     [MIPSU_RESULT_BAD_RADIX]       = MIPSU_EXIT_PARSE,
@@ -376,6 +386,7 @@ static const mipsu_exit_t mipsu_err_lut[] = {
     [MIPSU_RESULT_INSTR_SIZE]      = MIPSU_EXIT_PARSE,
 
     [MIPSU_RESULT_BUFF_OVERFLOW] = MIPSU_EXIT_INTERNAL,
+    [MIPSU_RESULT_READ_FILE]     = MIPSU_EXIT_INTERNAL,
     [MIPSU_RESULT_OPEN_FILE]     = MIPSU_EXIT_INTERNAL,
 };
 
@@ -385,6 +396,7 @@ static const mipsu_flag_entry_t mipsu_flag_lut[] = {
     {"no-color", MIPSU_FLAG_NO_COLOR, 0},
     {"nreg", MIPSU_FLAG_NREG, 'n'},
     {"strict", MIPSU_FLAG_STRICT, 's'},
+    {"raw", MIPSU_FLAG_RAW, 0},
 };
 
 static const size_t mipsu_flagc =
@@ -418,6 +430,7 @@ static const char* mipsu_usage =
     "      --no-color  plain output\n"
     "  -n, --nreg      use numbers when formatting registers\n"
     "  -s, --strict    enable strict parsing\n"
+    "      --raw       handle raw binary files\n"
     "\n"
     "options:\n"
     "  -o <file>, --output <file>  Specify an output file\n"
@@ -1146,7 +1159,10 @@ static void mipsu_dump_field(mipsu_word_t w, mipsu_field_t f, mipsu_ctx_t c) {
 }
 
 static void mipsu_dump_word(mipsu_word_t w, mipsu_ctx_t c) {
-    fprintf(c.o, "0x%08X\n", w);
+    if (mipsu_get_flag(c, MIPSU_FLAG_RAW))
+        fwrite(&w, mipsu_word_size, 1, c.o);
+    else
+        fprintf(c.o, "0x%08X\n", w);
 }
 
 static void mipsu_dump_mnem(mipsu_field_t f, mipsu_ctx_t c) {
@@ -1219,10 +1235,39 @@ static mipsu_result_t mipsu_args_encode(size_t n, const char** args,
     return r;
 }
 
+static mipsu_result_t mipsu_raw_disasm(mipsu_ctx_t c) {
+    mipsu_word_t w;
+    size_t       s, i;
+
+    if (c.f == stdin) return MIPSU_RESULT_RAW_STDIN;
+
+    fseek(c.f, 0, SEEK_END);
+    s = ftell(c.f);
+    fseek(c.f, 0, SEEK_SET);
+
+    if (s > mipsu_cp_len) return MIPSU_RESULT_BUFF_OVERFLOW;
+
+    i = fread(mipsu_cp_buff, 1, s, c.f);
+
+    if (i != s) return MIPSU_RESULT_READ_FILE;
+
+    for (i = 0; i < s; i += mipsu_word_size) {
+        w = *(mipsu_word_t*)(mipsu_cp_buff + i);
+
+        mipsu_dump_disasm(w, c);
+    }
+
+    return MIPSU_RESULT_OK;
+}
+
 static mipsu_result_t mipsu_file_disasm(mipsu_ctx_t c) {
     mipsu_word_t   w;
     bool_t         s = false;
     mipsu_result_t r;
+
+    bool_t raw = mipsu_get_flag(c, MIPSU_FLAG_RAW);
+
+    if (raw) return mipsu_raw_disasm(c);
 
     while (fgets(mipsu_chr_buff, mipsu_chr_len, c.f)) {
 
@@ -1231,6 +1276,7 @@ static mipsu_result_t mipsu_file_disasm(mipsu_ctx_t c) {
         r = mipsu_parse_word(mipsu_chr_buff, &w, 32);
 
         if (r) {
+            if (mipsu_get_flag(c, MIPSU_FLAG_STRICT)) return r;
             mipsu_wrnrv(r, mipsu_chr_buff, c);
             s = true;
             continue;
@@ -1286,6 +1332,9 @@ static mipsu_result_t mipsu_file_asm(mipsu_ctx_t c) {
     mipsu_result_t r;
     mipsu_field_t  f;
 
+    if (c.o == stdout && mipsu_get_flag(c, MIPSU_FLAG_RAW))
+        return MIPSU_RESULT_RAW_STDOUT;
+
     while (fgets(mipsu_chr_buff, mipsu_chr_len, c.f)) {
 
         *strchr(mipsu_chr_buff, '\n') = 0;
@@ -1297,6 +1346,7 @@ static mipsu_result_t mipsu_file_asm(mipsu_ctx_t c) {
         if (!r) r = mipsu_asm(n, a, &f, c);
 
         if (r) {
+            if (mipsu_get_flag(c, MIPSU_FLAG_STRICT)) return r;
             mipsu_wrnrv(r, mipsu_chr_buff, c);
             s = true;
             continue;
