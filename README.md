@@ -68,7 +68,7 @@ Encode instruction fields into machine code.
 mipsu encode R 0x05 0x18 0x02 0x00 0x20
 ```
 
-Output:
+Output
 
 ```
 hex:  0x00B81020
@@ -89,7 +89,7 @@ Disassemble machine code into human-readable assembly.
 mipsu disasm 0x00b81020
 ```
 
-Output:
+Output
 
 ```
 0x00B81020  add      $v0  , $a1  , $t8
