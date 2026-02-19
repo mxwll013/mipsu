@@ -19,7 +19,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MIPSU_VERSION "0.0.2"
+#define MIPSU_VERSION "0.0.3"
+
+#define true  1
+#define false 0
+
+typedef int  bool_t;
+typedef FILE file_t;
 
 typedef uint32_t               mipsu_word_t;
 typedef enum mipsu_type        mipsu_type_t;
@@ -71,19 +77,33 @@ enum mipsu_exit {
 
 enum mipsu_result {
     MIPSU_RESULT_OK,
+
     MIPSU_RESULT_BAD_CMD,
+    MIPSU_RESULT_BAD_ARGC,
     MIPSU_RESULT_MISSING_ARGS,
     MIPSU_RESULT_TOO_MANY_ARGS,
-    MIPSU_RESULT_BAD_TYPE,
-    MIPSU_RESULT_BAD_BASE,
+    MIPSU_RESULT_FROM_FILE,
+    MIPSU_RESULT_STDIN_CHAR,
+
+    MIPSU_RESULT_BAD_RADIX,
     MIPSU_RESULT_BAD_HEX,
+    MIPSU_RESULT_MISSING_HEXITS,
+    MIPSU_RESULT_TOO_MANY_HEXITS,
     MIPSU_RESULT_BAD_BIN,
+    MIPSU_RESULT_MISSING_BITS,
+    MIPSU_RESULT_TOO_MANY_BITS,
     MIPSU_RESULT_BAD_OP,
     MIPSU_RESULT_BAD_OP_FMT,
+    MIPSU_RESULT_BAD_OP_TYPE,
+    MIPSU_RESULT_BAD_INSTR,
+    MIPSU_RESULT_BAD_FN,
     MIPSU_RESULT_BAD_REG,
     MIPSU_RESULT_FIELD_OVERFLOW,
     MIPSU_RESULT_SKIPPED,
+    MIPSU_RESULT_INSTR_SIZE,
+
     MIPSU_RESULT_BUFF_OVERFLOW,
+    MIPSU_RESULT_OPEN_FILE,
 };
 
 enum mipsu_flag {
@@ -91,6 +111,7 @@ enum mipsu_flag {
     MIPSU_FLAG_VERBOSE  = 1 << 1,
     MIPSU_FLAG_NO_COLOR = 1 << 2,
     MIPSU_FLAG_NREG     = 1 << 3,
+    MIPSU_FLAG_STRICT   = 1 << 4,
 };
 
 static const uint8_t mipsu_op_offset = 26;
@@ -104,16 +125,19 @@ static const uint8_t  mipsu_5bit_mask  = 0b00011111;
 static const uint16_t mipsu_16bit_mask = 0xFFFF;
 static const uint32_t mipsu_26bit_mask = 0x03FFFFFF;
 
-static const char* mipsu_fmt_none    = "%-8s";
-static const char* mipsu_fmt_hex     = "%-8s 0x%08X";
-static const char* mipsu_fmt_1r      = "%-8s $%-4s";
-static const char* mipsu_fmt_2r      = "%-8s $%-4s, $%-4s";
-static const char* mipsu_fmt_3r      = "%-8s $%-4s, $%-4s, $%-4s";
-static const char* mipsu_fmt_2r_sh   = "%-8s $%-4s, $%-4s, %hhu";
-static const char* mipsu_fmt_1r_imm  = "%-8s $%-4s, %hi";
-static const char* mipsu_fmt_2r_imm  = "%-8s $%-4s, $%-4s, %hi";
-static const char* mipsu_fmt_r_imm_r = "%-8s $%-4s, %hi($%s)";
-static const char* mipsu_fmt_addr    = "%-8s %u";
+static const char* mipsu_fmt_none    = "%-8s\n";
+static const char* mipsu_fmt_hex     = "%-8s 0x%08X\n";
+static const char* mipsu_fmt_1r      = "%-8s $%-4s\n";
+static const char* mipsu_fmt_2r      = "%-8s $%-4s, $%-4s\n";
+static const char* mipsu_fmt_3r      = "%-8s $%-4s, $%-4s, $%-4s\n";
+static const char* mipsu_fmt_2r_sh   = "%-8s $%-4s, $%-4s, %hhu\n";
+static const char* mipsu_fmt_1r_imm  = "%-8s $%-4s, %hi\n";
+static const char* mipsu_fmt_2r_imm  = "%-8s $%-4s, $%-4s, %hi\n";
+static const char* mipsu_fmt_r_imm_r = "%-8s $%-4s, %hi($%s)\n";
+static const char* mipsu_fmt_addr    = "%-8s %u\n";
+
+static const char mipsu_color_err = '1';
+static const char mipsu_color_wrn = '3';
 
 struct mipsu_reg_entry {
     const char* name;
@@ -130,16 +154,21 @@ struct mipsu_field {
     mipsu_type_t type;
     uint8_t      op;
     union {
-        struct {
-            uint8_t rs, rt, rd, sh, fn;
-        } r;
+
         struct {
             uint8_t rs, rt;
-            int16_t imm;
-        } i;
-        struct {
-            uint32_t addr;
-        } j;
+
+            union {
+                struct {
+                    uint8_t rd, sh, fn;
+                };
+                struct {
+                    int16_t imm;
+                };
+            };
+        };
+
+        uint32_t addr;
     };
 };
 
@@ -151,13 +180,15 @@ struct mipsu_flag_entry {
 
 struct mipsu_cmd {
     const char* name;
-    mipsu_result_t (*no_arg)(mipsu_ctx_t c);
-    mipsu_result_t (*one_arg)(const char*, mipsu_ctx_t c);
-    mipsu_result_t (*any_arg)(int32_t, const char**, mipsu_ctx_t c);
+    mipsu_result_t (*from_file)(mipsu_ctx_t c);
+    mipsu_result_t (*from_arg)(const char*, mipsu_ctx_t c);
+    mipsu_result_t (*from_args)(size_t, const char**, mipsu_ctx_t c);
 };
 
 struct mipsu_ctx {
     mipsu_flag_t flags;
+    file_t*      o;
+    file_t*      f;
 };
 
 static const mipsu_reg_entry_t mipsu_reg_lut[] = {
@@ -284,54 +315,78 @@ static const char mipsu_type_lut[] = {
 
 static const char* mipsu_err_msg_lut[] = {
     [MIPSU_EXIT_OK]       = "ok",
-    [MIPSU_EXIT_USAGE]    = "bad usage",
+    [MIPSU_EXIT_USAGE]    = "usage error",
     [MIPSU_EXIT_PARSE]    = "parse error",
     [MIPSU_EXIT_INTERNAL] = "internal error",
 };
 
 static const char* mipsu_res_msg_lut[] = {
-    [MIPSU_RESULT_OK]             = "ok",
-    [MIPSU_RESULT_BAD_CMD]        = "bad command",
-    [MIPSU_RESULT_MISSING_ARGS]   = "missing argument(s)",
-    [MIPSU_RESULT_TOO_MANY_ARGS]  = "too many arguments",
-    [MIPSU_RESULT_BAD_TYPE]       = "bad type",
-    [MIPSU_RESULT_BAD_BASE]       = "bad base",
-    [MIPSU_RESULT_BAD_HEX]        = "bad hex",
-    [MIPSU_RESULT_BAD_BIN]        = "bad binary",
-    [MIPSU_RESULT_BAD_OP]         = "bad operation",
-    [MIPSU_RESULT_BAD_OP_FMT]     = "bad operation format",
-    [MIPSU_RESULT_BAD_REG]        = "bad register",
-    [MIPSU_RESULT_FIELD_OVERFLOW] = "field overflow",
-    [MIPSU_RESULT_SKIPPED]        = "skipped instruction(s)",
-    [MIPSU_RESULT_BUFF_OVERFLOW]  = "buffer overflow",
+    [MIPSU_RESULT_OK] = "ok",
+
+    [MIPSU_RESULT_BAD_CMD]       = "unknown command",
+    [MIPSU_RESULT_BAD_ARGC]      = "invalid number of arguments",
+    [MIPSU_RESULT_MISSING_ARGS]  = "missing argument(s)",
+    [MIPSU_RESULT_TOO_MANY_ARGS] = "too many arguments",
+    [MIPSU_RESULT_FROM_FILE]     = "command does not allow reading from file",
+    [MIPSU_RESULT_STDIN_CHAR]    = "drop '-' to read from stdin",
+
+    [MIPSU_RESULT_BAD_RADIX]       = "unknown radix (base)",
+    [MIPSU_RESULT_BAD_HEX]         = "invalid hexadcimal number",
+    [MIPSU_RESULT_MISSING_HEXITS]  = "missing hexit(s)",
+    [MIPSU_RESULT_TOO_MANY_HEXITS] = "too many hexits",
+    [MIPSU_RESULT_BAD_BIN]         = "invalid binary number",
+    [MIPSU_RESULT_MISSING_BITS]    = "missing bit(s)",
+    [MIPSU_RESULT_TOO_MANY_BITS]   = "too many bits",
+    [MIPSU_RESULT_BAD_OP]          = "unknown operation",
+    [MIPSU_RESULT_BAD_OP_FMT]      = "unknown operation format",
+    [MIPSU_RESULT_BAD_OP_TYPE]     = "unknown operation type",
+    [MIPSU_RESULT_BAD_INSTR]       = "unknown instruction",
+    [MIPSU_RESULT_BAD_REG]         = "bad register",
+    [MIPSU_RESULT_FIELD_OVERFLOW]  = "field overflow",
+    [MIPSU_RESULT_SKIPPED]         = "skipped data",
+    [MIPSU_RESULT_INSTR_SIZE]      = "too many instruction arguments",
+
+    [MIPSU_RESULT_BUFF_OVERFLOW] = "buffer overflow",
+    [MIPSU_RESULT_OPEN_FILE]     = "failed to open file",
 };
 
 static const mipsu_exit_t mipsu_err_lut[] = {
     [MIPSU_RESULT_OK] = MIPSU_EXIT_OK,
 
     [MIPSU_RESULT_BAD_CMD]       = MIPSU_EXIT_USAGE,
+    [MIPSU_RESULT_BAD_ARGC]      = MIPSU_EXIT_USAGE,
     [MIPSU_RESULT_MISSING_ARGS]  = MIPSU_EXIT_USAGE,
     [MIPSU_RESULT_TOO_MANY_ARGS] = MIPSU_EXIT_USAGE,
+    [MIPSU_RESULT_FROM_FILE]     = MIPSU_EXIT_USAGE,
+    [MIPSU_RESULT_STDIN_CHAR]    = MIPSU_EXIT_USAGE,
 
-    [MIPSU_RESULT_BAD_TYPE]       = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_BAD_BASE]       = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_BAD_HEX]        = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_BAD_BIN]        = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_BAD_OP]         = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_BAD_OP_FMT]     = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_BAD_REG]        = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_FIELD_OVERFLOW] = MIPSU_EXIT_PARSE,
-    [MIPSU_RESULT_SKIPPED]        = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_BAD_RADIX]       = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_BAD_HEX]         = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_MISSING_HEXITS]  = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_TOO_MANY_HEXITS] = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_BAD_BIN]         = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_MISSING_BITS]    = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_TOO_MANY_BITS]   = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_BAD_OP]          = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_BAD_OP_FMT]      = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_BAD_OP_TYPE]     = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_BAD_REG]         = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_FIELD_OVERFLOW]  = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_SKIPPED]         = MIPSU_EXIT_PARSE,
+    [MIPSU_RESULT_INSTR_SIZE]      = MIPSU_EXIT_PARSE,
 
     [MIPSU_RESULT_BUFF_OVERFLOW] = MIPSU_EXIT_INTERNAL,
+    [MIPSU_RESULT_OPEN_FILE]     = MIPSU_EXIT_INTERNAL,
 };
 
 static const mipsu_flag_entry_t mipsu_flag_lut[] = {
     {"quiet", MIPSU_FLAG_QUIET, 'q'},
     {"verbose", MIPSU_FLAG_VERBOSE, 'v'},
-    {"no-color", MIPSU_FLAG_NO_COLOR, '\0'},
+    {"no-color", MIPSU_FLAG_NO_COLOR, 0},
     {"nreg", MIPSU_FLAG_NREG, 'n'},
+    {"strict", MIPSU_FLAG_STRICT, 's'},
 };
+
 static const size_t mipsu_flagc =
     sizeof(mipsu_flag_lut) / sizeof(mipsu_flag_entry_t);
 
@@ -341,11 +396,13 @@ static const char* mipsu_usage =
     "\n"
     "usage:\n"
     "  mipsu decode <hex | bin>\n"
-    "  mipsu disasm [hex | bin]\n"
+    "  mipsu disasm <hex | bin>\n"
+    "  mipsu disasm -f <file>\n"
     "  mipsu encode -R <rs> <rt> <rd> <sh> <fn>\n"
     "  mipsu encode -I <op> <rs> <rt> <imm>\n"
     "  mipsu encode -J <op> <addr>\n"
-    "  mipsu asm    [assembly]\n"
+    "  mipsu asm    <mips>\n"
+    "  mipsu asm    -f <file>\n"
     "  mipsu --version\n"
     "  mipsu --help | -h\n"
     "\n"
@@ -359,13 +416,25 @@ static const char* mipsu_usage =
     "  -q, --quiet     minimal output\n"
     "  -v, --verbose   maximal output\n"
     "      --no-color  plain output\n"
-    "  -n, --nreg      use register numbers\n";
+    "  -n, --nreg      use numbers when formatting registers\n"
+    "  -s, --strict    enable strict parsing\n"
+    "\n"
+    "options:\n"
+    "  -o <file>, --output <file>  Specify an output file\n"
+    "  -f <file>, --file   <file>  Specify an input file\n";
 
-static char mipsu_chr_buff[2048];
+static char mipsu_chr_buff[1024];
+static char mipsu_cp_buff[1024];
+
+static const size_t mipsu_chr_len = sizeof(mipsu_chr_buff);
+static const size_t mipsu_cp_len  = sizeof(mipsu_cp_buff);
+static const size_t mipsu_cp_last = mipsu_cp_len - 1;
 
 /* === CLI utils === */
 
-static int mipsu_get_flag(mipsu_ctx_t c, mipsu_flag_t f) { return c.flags & f; }
+static bool_t mipsu_get_flag(mipsu_ctx_t c, mipsu_flag_t f) {
+    return c.flags & f;
+}
 static void mipsu_set_flag(mipsu_ctx_t* c, mipsu_flag_t f) { c->flags |= f; }
 
 static void mipsu_cerr(const char* msg, char col, const char* v,
@@ -373,7 +442,7 @@ static void mipsu_cerr(const char* msg, char col, const char* v,
     char       start[6];
     const char reset[] = "\033[0m";
 
-    int no_col = mipsu_get_flag(c, MIPSU_FLAG_NO_COLOR);
+    bool_t no_col = mipsu_get_flag(c, MIPSU_FLAG_NO_COLOR);
     sprintf(start, "\033[3%cm", col);
 
     if (v)
@@ -392,16 +461,19 @@ static void mipsu_cerr(const char* msg, char col, const char* v,
 }
 
 static void mipsu_err(const char* msg, mipsu_ctx_t c) {
-    mipsu_cerr(msg, '1', NULL, c);
+    mipsu_cerr(msg, mipsu_color_err, NULL, c);
 }
+
 static void mipsu_errv(const char* msg, const char* v, mipsu_ctx_t c) {
-    mipsu_cerr(msg, '1', v, c);
+    mipsu_cerr(msg, mipsu_color_err, v, c);
 }
-static void mipsu_wrn(const char* msg, mipsu_ctx_t c) {
-    mipsu_cerr(msg, '3', NULL, c);
+
+static void mipsu_wrnr(mipsu_result_t r, mipsu_ctx_t c) {
+    mipsu_cerr(mipsu_res_msg_lut[r], mipsu_color_wrn, NULL, c);
 }
-static void mipsu_wrnv(const char* msg, const char* v, mipsu_ctx_t c) {
-    mipsu_cerr(msg, '3', v, c);
+
+static void mipsu_wrnrv(mipsu_result_t r, const char* v, mipsu_ctx_t c) {
+    mipsu_cerr(mipsu_res_msg_lut[r], mipsu_color_wrn, v, c);
 }
 
 static void mipsu_exit_ok() { exit(MIPSU_EXIT_OK); }
@@ -423,32 +495,43 @@ static void mipsu_exitrv(mipsu_result_t r, const char* v, mipsu_ctx_t c) {
 
 /* === Parsing === */
 
-static int mipsu_ignore(char c) {
+static bool_t mipsu_ignore(char c) {
     switch (c) {
     case ' ':
     case '\n':
     case ',':
     case '(':
     case ')':
-        return 1;
+        return true;
     default:
-        return 0;
+        return false;
     }
 }
 
-static int mipsu_bin_spec(char c) { return c == 'B' || c == 'b'; }
-static int mipsu_hex_spec(char c) { return c == 'X' || c == 'x'; }
-static int mipsu_bin_valid(const char* s, size_t n) {
+static bool_t mipsu_bin_spec(char c) { return c == 'B' || c == 'b'; }
+static bool_t mipsu_hex_spec(char c) { return c == 'X' || c == 'x'; }
+
+static mipsu_result_t mipsu_bin_valid(const char* s, size_t n) {
     size_t i;
-    for (i = 0; i < n; ++i)
-        if (s[i] != '0' && s[i] != '1') return 0;
-    return 1;
+
+    for (i = 0; i < n; ++i) {
+        if (!s[i]) return MIPSU_RESULT_MISSING_BITS;
+        if (s[i] != '0' && s[i] != '1') return MIPSU_RESULT_BAD_BIN;
+    }
+
+    return s[n] ? MIPSU_RESULT_TOO_MANY_BITS : MIPSU_RESULT_OK;
 }
-static int mipsu_hex_valid(const char* s, size_t n) {
+static mipsu_result_t mipsu_hex_valid(const char* s, size_t n) {
     size_t i;
-    for (i = 0; i < n; ++i)
-        if (s[i] != '0' && !mipsu_hex_lut[(size_t)s[i]]) return 0;
-    return 1;
+
+    for (i = 0; i < n; ++i) {
+        if (!s[i]) return MIPSU_RESULT_MISSING_HEXITS;
+
+        if (s[i] != '0' && !mipsu_hex_lut[(size_t)s[i]])
+            return MIPSU_RESULT_BAD_HEX;
+    }
+
+    return s[n] ? MIPSU_RESULT_TOO_MANY_HEXITS : MIPSU_RESULT_OK;
 }
 
 static mipsu_word_t mipsu_get_word(const char* s, size_t n, uint8_t sh) {
@@ -463,19 +546,22 @@ static mipsu_word_t mipsu_get_word(const char* s, size_t n, uint8_t sh) {
 
 static mipsu_result_t mipsu_parse_word(const char* s, mipsu_word_t* out,
                                        uint8_t b) {
-    size_t  n  = b;
-    uint8_t sh = 1;
+    size_t         n  = b;
+    uint8_t        sh = 1;
+    mipsu_result_t r;
 
-    if (s[0] != '0') return MIPSU_RESULT_BAD_BASE;
+    if (s[0] != '0') return MIPSU_RESULT_BAD_RADIX;
 
     if (mipsu_hex_spec(s[1])) {
         n  = (b + 3) / 4;
         sh = 4;
-        if (!mipsu_hex_valid(s + 2, n)) return MIPSU_RESULT_BAD_HEX;
+        r  = mipsu_hex_valid(s + 2, n);
+        if (r) return r;
     } else if (mipsu_bin_spec(s[1])) {
-        if (!mipsu_bin_valid(s + 2, n)) return MIPSU_RESULT_BAD_BIN;
+        r = mipsu_bin_valid(s + 2, n);
+        if (r) return r;
     } else
-        return MIPSU_RESULT_BAD_BASE;
+        return MIPSU_RESULT_BAD_RADIX;
 
     *out = mipsu_get_word(s + 2, n, sh);
 
@@ -486,8 +572,14 @@ static mipsu_result_t mipsu_parse_word(const char* s, mipsu_word_t* out,
 
 static mipsu_result_t mipsu_parse_type(const char* s, mipsu_type_t* out,
                                        mipsu_ctx_t c) {
-    if (strlen(s) > 2) return MIPSU_RESULT_BAD_TYPE;
-    if (s[0] == '-') ++s;
+    if (strlen(s) > 2) return MIPSU_RESULT_BAD_OP_TYPE;
+
+    bool_t prefixed = s[0] == '-';
+    bool_t strict   = mipsu_get_flag(c, MIPSU_FLAG_STRICT);
+
+    if (!prefixed && strict) return MIPSU_RESULT_BAD_OP_TYPE;
+
+    if (prefixed) ++s;
 
     switch (s[0]) {
     case 'R':
@@ -503,13 +595,10 @@ static mipsu_result_t mipsu_parse_type(const char* s, mipsu_type_t* out,
         *out = MIPSU_TYPE_J;
         break;
     default:
-        mipsu_errv("unknown type", s, c);
-        return MIPSU_RESULT_BAD_TYPE;
+        return MIPSU_RESULT_BAD_OP_TYPE;
     }
 
-    if (s[1]) return MIPSU_RESULT_BAD_TYPE;
-
-    return MIPSU_RESULT_OK;
+    return s[1] ? MIPSU_RESULT_BAD_OP_TYPE : MIPSU_RESULT_OK;
 }
 
 static mipsu_result_t mipsu_parse_field_hlpr(const char* s, const char* msg,
@@ -536,19 +625,19 @@ static mipsu_result_t mipsu_parse_r_field(int32_t argc, const char** argv,
     out->type = MIPSU_TYPE_R;
     out->op   = 0;
 
-    r = mipsu_parse_field_hlpr(argv[1], "in <rs>", &out->r.rs, 5, c);
+    r = mipsu_parse_field_hlpr(argv[1], "in <rs>", &out->rs, 5, c);
     if (r) return r;
 
-    r = mipsu_parse_field_hlpr(argv[2], "in <rt>", &out->r.rt, 5, c);
+    r = mipsu_parse_field_hlpr(argv[2], "in <rt>", &out->rt, 5, c);
     if (r) return r;
 
-    r = mipsu_parse_field_hlpr(argv[3], "in <rd>", &out->r.rd, 5, c);
+    r = mipsu_parse_field_hlpr(argv[3], "in <rd>", &out->rd, 5, c);
     if (r) return r;
 
-    r = mipsu_parse_field_hlpr(argv[4], "in <sh>", &out->r.sh, 5, c);
+    r = mipsu_parse_field_hlpr(argv[4], "in <sh>", &out->sh, 5, c);
     if (r) return r;
 
-    r = mipsu_parse_field_hlpr(argv[5], "in <fn>", &out->r.fn, 6, c);
+    r = mipsu_parse_field_hlpr(argv[5], "in <fn>", &out->fn, 6, c);
 
     return r;
 }
@@ -566,14 +655,14 @@ static mipsu_result_t mipsu_parse_i_field(int32_t argc, const char** argv,
     r = mipsu_parse_field_hlpr(argv[1], "in <op>", &out->op, 6, c);
     if (r) return r;
 
-    r = mipsu_parse_field_hlpr(argv[2], "in <rs>", &out->i.rs, 5, c);
+    r = mipsu_parse_field_hlpr(argv[2], "in <rs>", &out->rs, 5, c);
     if (r) return r;
 
-    r = mipsu_parse_field_hlpr(argv[3], "in <rt>", &out->i.rt, 5, c);
+    r = mipsu_parse_field_hlpr(argv[3], "in <rt>", &out->rt, 5, c);
     if (r) return r;
 
-    r          = mipsu_parse_word(argv[4], &w, 16);
-    out->i.imm = w;
+    r        = mipsu_parse_word(argv[4], &w, 16);
+    out->imm = w;
     if (r) mipsu_errv("in <imm>", argv[4], c);
 
     return r;
@@ -592,8 +681,8 @@ static mipsu_result_t mipsu_parse_j_field(int32_t argc, const char** argv,
     r = mipsu_parse_field_hlpr(argv[1], "in <op>", &out->op, 6, c);
     if (r) return r;
 
-    r         = mipsu_parse_word(argv[2], &w, 26);
-    out->i.rs = w;
+    r       = mipsu_parse_word(argv[2], &w, 26);
+    out->rs = w;
     if (r) mipsu_errv("in <addr>", argv[2], c);
 
     return r;
@@ -639,8 +728,15 @@ static mipsu_result_t mipsu_parse_op(const char* s, mipsu_op_entry_t* e,
     return MIPSU_RESULT_BAD_OP;
 }
 
-static mipsu_result_t mipsu_parse_reg(const char* s, uint8_t* r) {
-    if (s[0] == '$') ++s;
+static mipsu_result_t mipsu_parse_reg(const char* s, uint8_t* r,
+                                      mipsu_ctx_t c) {
+
+    bool_t prefixed = s[0] == '$';
+    bool_t strict   = mipsu_get_flag(c, MIPSU_FLAG_STRICT);
+
+    if (!prefixed && strict) return MIPSU_RESULT_BAD_REG;
+
+    if (prefixed) ++s;
 
     for (*r = 0; *r < mipsu_regc; ++(*r))
         if (!strcmp(s, mipsu_reg_lut[*r].name)) return MIPSU_RESULT_OK;
@@ -670,54 +766,56 @@ static mipsu_result_t mipsu_parse_sh(const char* s, uint8_t* sh) {
     return r;
 }
 
-static mipsu_result_t mipsu_parse_1r(size_t n, const char** a, uint8_t* r1) {
+static mipsu_result_t mipsu_parse_1r(size_t n, const char** a, uint8_t* r1,
+                                     mipsu_ctx_t c) {
     mipsu_result_t r;
 
     if (n != 2) return MIPSU_RESULT_BAD_OP_FMT;
 
-    r = mipsu_parse_reg(a[1], r1);
+    r = mipsu_parse_reg(a[1], r1, c);
     return r;
 }
 
 static mipsu_result_t mipsu_parse_2r(size_t n, const char** a, uint8_t* r1,
-                                     uint8_t* r2) {
+                                     uint8_t* r2, mipsu_ctx_t c) {
     mipsu_result_t r;
 
     if (n != 3) return MIPSU_RESULT_BAD_OP_FMT;
 
-    r = mipsu_parse_reg(a[1], r1);
+    r = mipsu_parse_reg(a[1], r1, c);
     if (r) return r;
 
-    r = mipsu_parse_reg(a[2], r2);
+    r = mipsu_parse_reg(a[2], r2, c);
     return r;
 }
 
 static mipsu_result_t mipsu_parse_3r(size_t n, const char** a, uint8_t* r1,
-                                     uint8_t* r2, uint8_t* r3) {
+                                     uint8_t* r2, uint8_t* r3, mipsu_ctx_t c) {
     mipsu_result_t r;
 
     if (n != 4) return MIPSU_RESULT_BAD_OP_FMT;
 
-    r = mipsu_parse_reg(a[1], r1);
+    r = mipsu_parse_reg(a[1], r1, c);
     if (r) return r;
 
-    r = mipsu_parse_reg(a[2], r2);
+    r = mipsu_parse_reg(a[2], r2, c);
     if (r) return r;
 
-    r = mipsu_parse_reg(a[3], r3);
+    r = mipsu_parse_reg(a[3], r3, c);
     return r;
 }
 
 static mipsu_result_t mipsu_parse_2r_sh(size_t n, const char** a, uint8_t* r1,
-                                        uint8_t* r2, uint8_t* sh) {
+                                        uint8_t* r2, uint8_t* sh,
+                                        mipsu_ctx_t c) {
     mipsu_result_t r;
 
     if (n != 4) return MIPSU_RESULT_BAD_OP_FMT;
 
-    r = mipsu_parse_reg(a[1], r1);
+    r = mipsu_parse_reg(a[1], r1, c);
     if (r) return r;
 
-    r = mipsu_parse_reg(a[2], r2);
+    r = mipsu_parse_reg(a[2], r2, c);
     if (r) return r;
 
     r = mipsu_parse_sh(a[3], sh);
@@ -725,12 +823,12 @@ static mipsu_result_t mipsu_parse_2r_sh(size_t n, const char** a, uint8_t* r1,
 }
 
 static mipsu_result_t mipsu_parse_1r_imm(size_t n, const char** a, uint8_t* r1,
-                                         int16_t* imm) {
+                                         int16_t* imm, mipsu_ctx_t c) {
     mipsu_result_t r;
 
     if (n != 3) return MIPSU_RESULT_BAD_OP_FMT;
 
-    r = mipsu_parse_reg(a[1], r1);
+    r = mipsu_parse_reg(a[1], r1, c);
     if (r) return r;
 
     r = mipsu_parse_imm(a[2], imm);
@@ -738,15 +836,16 @@ static mipsu_result_t mipsu_parse_1r_imm(size_t n, const char** a, uint8_t* r1,
 }
 
 static mipsu_result_t mipsu_parse_2r_imm(size_t n, const char** a, uint8_t* r1,
-                                         uint8_t* r2, int16_t* imm) {
+                                         uint8_t* r2, int16_t* imm,
+                                         mipsu_ctx_t c) {
     mipsu_result_t r;
 
     if (n != 4) return MIPSU_RESULT_BAD_OP_FMT;
 
-    r = mipsu_parse_reg(a[1], r1);
+    r = mipsu_parse_reg(a[1], r1, c);
     if (r) return r;
 
-    r = mipsu_parse_reg(a[2], r2);
+    r = mipsu_parse_reg(a[2], r2, c);
     if (r) return r;
 
     r = mipsu_parse_imm(a[3], imm);
@@ -754,18 +853,19 @@ static mipsu_result_t mipsu_parse_2r_imm(size_t n, const char** a, uint8_t* r1,
 }
 
 static mipsu_result_t mipsu_parse_r_imm_r(size_t n, const char** a, uint8_t* r1,
-                                          int16_t* imm, uint8_t* r2) {
+                                          int16_t* imm, uint8_t* r2,
+                                          mipsu_ctx_t c) {
     mipsu_result_t r;
 
     if (n != 4) return MIPSU_RESULT_BAD_OP_FMT;
 
-    r = mipsu_parse_reg(a[1], r1);
+    r = mipsu_parse_reg(a[1], r1, c);
     if (r) return r;
 
     r = mipsu_parse_imm(a[2], imm);
     if (r) return r;
 
-    r = mipsu_parse_reg(a[3], r2);
+    r = mipsu_parse_reg(a[3], r2, c);
     return r;
 }
 
@@ -777,41 +877,63 @@ static mipsu_result_t mipsu_parse_addr(size_t n, const char** a,
     return mipsu_parse_word(a[1], addr, 26);
 }
 
+static mipsu_result_t mipsu_parse_asm(const char* s, const char** a,
+                                      size_t* n) {
+    size_t i;
+
+    *n = 0;
+
+    strncpy(mipsu_cp_buff, s, mipsu_cp_last);
+
+    if (mipsu_cp_buff[mipsu_cp_last]) return MIPSU_RESULT_BUFF_OVERFLOW;
+
+    for (i = 0; mipsu_cp_buff[i]; ++i) {
+
+        if (mipsu_ignore(mipsu_cp_buff[i])) continue;
+
+        if (*n < 4)
+            a[(*n)++] = mipsu_cp_buff + i;
+
+        else
+            return MIPSU_RESULT_INSTR_SIZE;
+
+        while (!mipsu_ignore(mipsu_cp_buff[i]) && mipsu_cp_buff[i])
+            ++i;
+
+        mipsu_cp_buff[i] = 0;
+    }
+
+    return MIPSU_RESULT_OK;
+}
+
 /* === Formatting === */
 
 static size_t mipsu_fmt_field(mipsu_word_t w, mipsu_field_t f, char* b,
                               mipsu_ctx_t c) {
 
-    const mipsu_reg_entry_t rse = mipsu_reg_lut[f.r.rs];
-    const mipsu_reg_entry_t rte = mipsu_reg_lut[f.r.rt];
-    const mipsu_reg_entry_t rde = mipsu_reg_lut[f.r.rd];
+    const mipsu_reg_entry_t rse = mipsu_reg_lut[f.rs];
+    const mipsu_reg_entry_t rte = mipsu_reg_lut[f.rt];
+    const mipsu_reg_entry_t rde = mipsu_reg_lut[f.rd];
 
-    const char* rs;
-    const char* rt;
-    const char* rd;
+    bool_t nreg = mipsu_get_flag(c, MIPSU_FLAG_NREG);
 
-    const char* fn = mipsu_fn_lut[f.r.fn].mnem;
+    const char* rs = nreg ? rse.num : rse.name;
+    const char* rt = nreg ? rte.num : rte.name;
+    const char* rd = nreg ? rde.num : rde.name;
+
+    const char* fn = mipsu_fn_lut[f.fn].mnem;
     const char* op = mipsu_op_lut[f.op].mnem;
 
     size_t o = 0;
 
     char t;
 
-    if (mipsu_get_flag(c, MIPSU_FLAG_NREG)) {
-        rs = rse.num;
-        rt = rte.num;
-        rd = rde.num;
-    } else {
-        rs = rse.name;
-        rt = rte.name;
-        rd = rde.name;
-    }
-
     if (!op || (f.type == MIPSU_TYPE_R && !fn))
-        mipsu_wrn("unknown instruction", c);
+        mipsu_wrnr(MIPSU_RESULT_BAD_INSTR, c);
 
     if (!mipsu_get_flag(c, MIPSU_FLAG_QUIET)) {
         t = mipsu_type_lut[f.type];
+
         o += sprintf(b + o, "hex:   0x%08X\n", w);
         o += sprintf(b + o, "type:  %c%s\n", t, op ? "" : "?");
         o += sprintf(b + o, "--------\n");
@@ -819,21 +941,21 @@ static size_t mipsu_fmt_field(mipsu_word_t w, mipsu_field_t f, char* b,
 
     switch (f.type) {
     case MIPSU_TYPE_R:
-        o += sprintf(b + o, "rs:  0x%02hhX  ($%s)\n", f.r.rs, rs);
-        o += sprintf(b + o, "rt:  0x%02hhX  ($%s)\n", f.r.rt, rt);
-        o += sprintf(b + o, "rd:  0x%02hhX  ($%s)\n", f.r.rd, rd);
-        o += sprintf(b + o, "sh:  0x%02hhX  (%hhu)\n", f.r.sh, f.r.sh);
-        o += sprintf(b + o, "fn:  0x%02hhX  (%s)", f.r.fn, fn ? fn : "?");
+        o += sprintf(b + o, "rs:  0x%02hhX  ($%s)\n", f.rs, rs);
+        o += sprintf(b + o, "rt:  0x%02hhX  ($%s)\n", f.rt, rt);
+        o += sprintf(b + o, "rd:  0x%02hhX  ($%s)\n", f.rd, rd);
+        o += sprintf(b + o, "sh:  0x%02hhX  (%hhu)\n", f.sh, f.sh);
+        o += sprintf(b + o, "fn:  0x%02hhX  (%s)\n", f.fn, fn ? fn : "?");
         break;
     case MIPSU_TYPE_I:
         o += sprintf(b + o, "op:   0x%02hhX    (%s)\n", f.op, op ? op : "?");
-        o += sprintf(b + o, "rs:   0x%02hhX    ($%s)\n", f.i.rs, rs);
-        o += sprintf(b + o, "rt:   0x%02hhX    ($%s)\n", f.i.rt, rt);
-        o += sprintf(b + o, "imm:  0x%04hX  (%hi)", f.i.imm, f.i.imm);
+        o += sprintf(b + o, "rs:   0x%02hhX    ($%s)\n", f.rs, rs);
+        o += sprintf(b + o, "rt:   0x%02hhX    ($%s)\n", f.rt, rt);
+        o += sprintf(b + o, "imm:  0x%04hX  (%hi)\n", f.imm, f.imm);
         break;
     case MIPSU_TYPE_J:
         o += sprintf(b + o, "op:    0x%02hhX      (%s)\n", f.op, op ? op : "?");
-        o += sprintf(b + o, "addr:  0x%08X  (%u)", f.j.addr, f.j.addr);
+        o += sprintf(b + o, "addr:  0x%08X  (%u)\n", f.addr, f.addr);
         break;
     }
 
@@ -867,19 +989,19 @@ static mipsu_field_t mipsu_decode(mipsu_word_t w) {
 
     if (f.op == 0) {
         f.type = MIPSU_TYPE_R;
-        f.r.rs = mipsu_rs(w);
-        f.r.rt = mipsu_rt(w);
-        f.r.rd = mipsu_rd(w);
-        f.r.sh = mipsu_sh(w);
-        f.r.fn = mipsu_fn(w);
+        f.rs   = mipsu_rs(w);
+        f.rt   = mipsu_rt(w);
+        f.rd   = mipsu_rd(w);
+        f.sh   = mipsu_sh(w);
+        f.fn   = mipsu_fn(w);
     } else if (f.op == 2 || f.op == 3) {
-        f.type   = MIPSU_TYPE_J;
-        f.j.addr = mipsu_addr(w);
+        f.type = MIPSU_TYPE_J;
+        f.addr = mipsu_addr(w);
     } else {
-        f.type  = MIPSU_TYPE_I;
-        f.i.rs  = mipsu_rs(w);
-        f.i.rt  = mipsu_rt(w);
-        f.i.imm = mipsu_imm(w);
+        f.type = MIPSU_TYPE_I;
+        f.rs   = mipsu_rs(w);
+        f.rt   = mipsu_rt(w);
+        f.imm  = mipsu_imm(w);
     }
 
     return f;
@@ -891,34 +1013,39 @@ static mipsu_word_t mipsu_encode(mipsu_field_t f) {
 
     switch (f.type) {
     case MIPSU_TYPE_R:
-        return (
-            ((mipsu_word_t)f.op << mipsu_op_offset) |
-            ((mipsu_word_t)f.r.rs << mipsu_rs_offset) |
-            ((mipsu_word_t)f.r.rt << mipsu_rt_offset) |
-            ((mipsu_word_t)f.r.rd << mipsu_rd_offset) |
-            ((mipsu_word_t)f.r.sh << mipsu_sh_offset | (mipsu_word_t)f.r.fn));
+        return (((mipsu_word_t)f.op << mipsu_op_offset) |
+                ((mipsu_word_t)f.rs << mipsu_rs_offset) |
+                ((mipsu_word_t)f.rt << mipsu_rt_offset) |
+                ((mipsu_word_t)f.rd << mipsu_rd_offset) |
+                ((mipsu_word_t)f.sh << mipsu_sh_offset | (mipsu_word_t)f.fn));
     case MIPSU_TYPE_I:
         return (((mipsu_word_t)f.op << mipsu_op_offset) |
-                ((mipsu_word_t)f.i.rs << mipsu_rs_offset) |
-                ((mipsu_word_t)f.i.rt << mipsu_rt_offset) |
-                ((mipsu_word_t)f.i.imm & mipsu_16bit_mask));
+                ((mipsu_word_t)f.rs << mipsu_rs_offset) |
+                ((mipsu_word_t)f.rt << mipsu_rt_offset) |
+                ((mipsu_word_t)f.imm & mipsu_16bit_mask));
     case MIPSU_TYPE_J:
-        return (((mipsu_word_t)f.op << mipsu_op_offset) |
-                (mipsu_word_t)f.j.addr);
+        return (((mipsu_word_t)f.op << mipsu_op_offset) | (mipsu_word_t)f.addr);
     }
 }
 
 /* === Disassembly === */
 
-static size_t mipsu_disasm(mipsu_field_t f, char* b) {
-    const char* rd = mipsu_reg_lut[f.r.rd].name;
-    const char* rs = mipsu_reg_lut[f.r.rs].name;
-    const char* rt = mipsu_reg_lut[f.r.rt].name;
+static size_t mipsu_disasm(mipsu_field_t f, char* b, mipsu_ctx_t c) {
+
+    const mipsu_reg_entry_t rse = mipsu_reg_lut[f.rs];
+    const mipsu_reg_entry_t rte = mipsu_reg_lut[f.rt];
+    const mipsu_reg_entry_t rde = mipsu_reg_lut[f.rd];
+
+    bool_t nreg = mipsu_get_flag(c, MIPSU_FLAG_NREG);
+
+    const char* rs = nreg ? rse.num : rse.name;
+    const char* rt = nreg ? rte.num : rte.name;
+    const char* rd = nreg ? rde.num : rde.name;
 
     mipsu_op_entry_t e;
 
     if (f.type == MIPSU_TYPE_R)
-        e = mipsu_fn_lut[f.r.fn];
+        e = mipsu_fn_lut[f.fn];
     else
         e = mipsu_op_lut[f.op];
 
@@ -933,35 +1060,38 @@ static size_t mipsu_disasm(mipsu_field_t f, char* b) {
     case MIPSU_OP_FMT_RD:
         return sprintf(b, mipsu_fmt_1r, e.mnem, rd);
     case MIPSU_OP_FMT_RS_RT:
-        return sprintf(b, mipsu_fmt_2r, e.mnem, rs, rd);
+        return sprintf(b, mipsu_fmt_2r, e.mnem, rs, rt);
     case MIPSU_OP_FMT_RD_RT_RS:
         return sprintf(b, mipsu_fmt_3r, e.mnem, rd, rt, rs);
     case MIPSU_OP_FMT_RD_RT_SH:
-        return sprintf(b, mipsu_fmt_2r_sh, e.mnem, rd, rt, f.r.sh);
+        return sprintf(b, mipsu_fmt_2r_sh, e.mnem, rd, rt, f.sh);
     case MIPSU_OP_FMT_RD_RS_RT:
         return sprintf(b, mipsu_fmt_3r, e.mnem, rd, rs, rt);
 
     case MIPSU_OP_FMT_RS_IMM:
-        return sprintf(b, mipsu_fmt_1r_imm, e.mnem, rs, f.i.imm);
+        return sprintf(b, mipsu_fmt_1r_imm, e.mnem, rs, f.imm);
     case MIPSU_OP_FMT_RT_IMM:
-        return sprintf(b, mipsu_fmt_1r_imm, e.mnem, rt, f.i.imm);
+        return sprintf(b, mipsu_fmt_1r_imm, e.mnem, rt, f.imm);
     case MIPSU_OP_FMT_RT_IMM_RS:
-        return sprintf(b, mipsu_fmt_r_imm_r, e.mnem, rt, f.i.imm, rs);
+        return sprintf(b, mipsu_fmt_r_imm_r, e.mnem, rt, f.imm, rs);
     case MIPSU_OP_FMT_RT_RS_IMM:
-        return sprintf(b, mipsu_fmt_2r_imm, e.mnem, rt, rs, f.i.imm);
+        return sprintf(b, mipsu_fmt_2r_imm, e.mnem, rt, rs, f.imm);
     case MIPSU_OP_FMT_RS_RT_IMM:
-        return sprintf(b, mipsu_fmt_2r_imm, e.mnem, rs, rt, f.i.imm);
+        return sprintf(b, mipsu_fmt_2r_imm, e.mnem, rs, rt, f.imm);
 
     case MIPSU_OP_FMT_ADDR:
-        return sprintf(b, mipsu_fmt_addr, e.mnem, f.j.addr);
+        return sprintf(b, mipsu_fmt_addr, e.mnem, f.addr);
     }
 }
 
 /* === Assembly === */
 
-static mipsu_result_t mipsu_asm(size_t n, const char** a, mipsu_field_t* f) {
+static mipsu_result_t mipsu_asm(size_t n, const char** a, mipsu_field_t* f,
+                                mipsu_ctx_t c) {
     mipsu_op_entry_t e;
     mipsu_result_t   r;
+
+    memset(f, 0, sizeof(mipsu_field_t));
 
     r = mipsu_parse_op(a[0], &e, &f->op);
     if (r) return r;
@@ -969,8 +1099,8 @@ static mipsu_result_t mipsu_asm(size_t n, const char** a, mipsu_field_t* f) {
     f->type = e.type;
 
     if (f->type == MIPSU_TYPE_R) {
-        f->r.fn = f->op;
-        f->op   = 0;
+        f->fn = f->op;
+        f->op = 0;
     }
 
     switch (e.fmt) {
@@ -980,31 +1110,31 @@ static mipsu_result_t mipsu_asm(size_t n, const char** a, mipsu_field_t* f) {
         return MIPSU_RESULT_OK;
 
     case MIPSU_OP_FMT_RS:
-        return mipsu_parse_1r(n, a, &f->r.rs);
+        return mipsu_parse_1r(n, a, &f->rs, c);
     case MIPSU_OP_FMT_RD:
-        return mipsu_parse_1r(n, a, &f->r.rd);
+        return mipsu_parse_1r(n, a, &f->rd, c);
     case MIPSU_OP_FMT_RS_RT:
-        return mipsu_parse_2r(n, a, &f->r.rs, &f->r.rt);
+        return mipsu_parse_2r(n, a, &f->rs, &f->rt, c);
     case MIPSU_OP_FMT_RD_RS_RT:
-        return mipsu_parse_3r(n, a, &f->r.rd, &f->r.rs, &f->r.rt);
+        return mipsu_parse_3r(n, a, &f->rd, &f->rs, &f->rt, c);
     case MIPSU_OP_FMT_RD_RT_RS:
-        return mipsu_parse_3r(n, a, &f->r.rd, &f->r.rt, &f->r.rs);
+        return mipsu_parse_3r(n, a, &f->rd, &f->rt, &f->rs, c);
     case MIPSU_OP_FMT_RD_RT_SH:
-        return mipsu_parse_2r_sh(n, a, &f->r.rd, &f->r.rt, &f->r.sh);
+        return mipsu_parse_2r_sh(n, a, &f->rd, &f->rt, &f->sh, c);
 
     case MIPSU_OP_FMT_RS_IMM:
-        return mipsu_parse_1r_imm(n, a, &f->i.rs, &f->i.imm);
+        return mipsu_parse_1r_imm(n, a, &f->rs, &f->imm, c);
     case MIPSU_OP_FMT_RT_IMM:
-        return mipsu_parse_1r_imm(n, a, &f->i.rt, &f->i.imm);
+        return mipsu_parse_1r_imm(n, a, &f->rt, &f->imm, c);
     case MIPSU_OP_FMT_RT_IMM_RS:
-        return mipsu_parse_r_imm_r(n, a, &f->i.rt, &f->i.imm, &f->i.rs);
+        return mipsu_parse_r_imm_r(n, a, &f->rt, &f->imm, &f->rs, c);
     case MIPSU_OP_FMT_RT_RS_IMM:
-        return mipsu_parse_2r_imm(n, a, &f->i.rt, &f->i.rs, &f->i.imm);
+        return mipsu_parse_2r_imm(n, a, &f->rt, &f->rs, &f->imm, c);
     case MIPSU_OP_FMT_RS_RT_IMM:
-        return mipsu_parse_2r_imm(n, a, &f->i.rs, &f->i.rt, &f->i.imm);
+        return mipsu_parse_2r_imm(n, a, &f->rs, &f->rt, &f->imm, c);
 
     case MIPSU_OP_FMT_ADDR:
-        return mipsu_parse_addr(n, a, &f->j.addr);
+        return mipsu_parse_addr(n, a, &f->addr);
     }
 }
 
@@ -1012,19 +1142,21 @@ static mipsu_result_t mipsu_asm(size_t n, const char** a, mipsu_field_t* f) {
 
 static void mipsu_dump_field(mipsu_word_t w, mipsu_field_t f, mipsu_ctx_t c) {
     mipsu_fmt_field(w, f, mipsu_chr_buff, c);
-    puts(mipsu_chr_buff);
+    fputs(mipsu_chr_buff, c.o);
 }
 
-static void mipsu_dump_word(mipsu_word_t w) { printf("0x%08X\n", w); }
-
-static void mipsu_dump_mnem(mipsu_field_t f) {
-    mipsu_disasm(f, mipsu_chr_buff);
-    puts(mipsu_chr_buff);
+static void mipsu_dump_word(mipsu_word_t w, mipsu_ctx_t c) {
+    fprintf(c.o, "0x%08X\n", w);
 }
 
-static void mipsu_dump_instr(mipsu_word_t w, mipsu_field_t f) {
-    mipsu_disasm(f, mipsu_chr_buff);
-    printf("0x%08X  %s\n", w, mipsu_chr_buff);
+static void mipsu_dump_mnem(mipsu_field_t f, mipsu_ctx_t c) {
+    mipsu_disasm(f, mipsu_chr_buff, c);
+    fputs(mipsu_chr_buff, c.o);
+}
+
+static void mipsu_dump_instr(mipsu_word_t w, mipsu_field_t f, mipsu_ctx_t c) {
+    mipsu_disasm(f, mipsu_chr_buff, c);
+    fprintf(c.o, "0x%08X  %s", w, mipsu_chr_buff);
 }
 
 static void mipsu_dump_decoded(mipsu_word_t w, mipsu_ctx_t c) {
@@ -1036,7 +1168,7 @@ static void mipsu_dump_encoded(mipsu_field_t f, mipsu_ctx_t c) {
     mipsu_word_t w = mipsu_encode(f);
 
     if (mipsu_get_flag(c, MIPSU_FLAG_QUIET))
-        mipsu_dump_word(w);
+        mipsu_dump_word(w, c);
     else
         mipsu_dump_field(w, f, c);
 }
@@ -1045,18 +1177,18 @@ static void mipsu_dump_disasm(mipsu_word_t w, mipsu_ctx_t c) {
     mipsu_field_t f = mipsu_decode(w);
 
     if (mipsu_get_flag(c, MIPSU_FLAG_QUIET))
-        mipsu_dump_mnem(f);
+        mipsu_dump_mnem(f, c);
     else
-        mipsu_dump_instr(w, f);
+        mipsu_dump_instr(w, f, c);
 }
 
 static void mipsu_dump_asm(mipsu_field_t f, mipsu_ctx_t c) {
     mipsu_word_t w = mipsu_encode(f);
 
     if (mipsu_get_flag(c, MIPSU_FLAG_QUIET))
-        mipsu_dump_word(w);
+        mipsu_dump_word(w, c);
     else
-        mipsu_dump_instr(w, f);
+        mipsu_dump_instr(w, f, c);
 }
 
 /* === Command Line Interface === */
@@ -1074,32 +1206,33 @@ static mipsu_result_t mipsu_arg_decode(const char* s, mipsu_ctx_t c) {
     return MIPSU_RESULT_OK;
 }
 
-static mipsu_result_t mipsu_args_encode(int32_t argc, const char** args,
+static mipsu_result_t mipsu_args_encode(size_t n, const char** args,
                                         mipsu_ctx_t c) {
 
     mipsu_field_t  f;
     mipsu_result_t r;
 
-    r = mipsu_parse_field(argc, args, &f, c);
+    r = mipsu_parse_field(n, args, &f, c);
 
-    if (r) return r;
+    if (!r) mipsu_dump_encoded(f, c);
 
-    mipsu_dump_encoded(f, c);
-
-    return MIPSU_RESULT_OK;
+    return r;
 }
 
-static mipsu_result_t mipsu_stdin_disasm(mipsu_ctx_t c) {
-    mipsu_word_t w;
-    user_size_t  s = 0;
+static mipsu_result_t mipsu_file_disasm(mipsu_ctx_t c) {
+    mipsu_word_t   w;
+    bool_t         s = false;
+    mipsu_result_t r;
 
-    while (fgets(mipsu_chr_buff, sizeof(mipsu_chr_buff), stdin)) {
+    while (fgets(mipsu_chr_buff, mipsu_chr_len, c.f)) {
 
-        *strchr(mipsu_chr_buff, '\n') = '\0';
+        *strchr(mipsu_chr_buff, '\n') = 0;
 
-        if (mipsu_parse_word(mipsu_chr_buff, &w, 32)) {
-            mipsu_wrnv("skipping instruction", mipsu_chr_buff, c);
-            ++s;
+        r = mipsu_parse_word(mipsu_chr_buff, &w, 32);
+
+        if (r) {
+            mipsu_wrnrv(r, mipsu_chr_buff, c);
+            s = true;
             continue;
         }
 
@@ -1122,14 +1255,12 @@ static mipsu_result_t mipsu_arg_disasm(const char* s, mipsu_ctx_t c) {
     return MIPSU_RESULT_OK;
 }
 
-static mipsu_result_t mipsu_args_asm(int32_t argc, const char** args,
+static mipsu_result_t mipsu_args_asm(size_t n, const char** args,
                                      mipsu_ctx_t c) {
     mipsu_result_t r;
     mipsu_field_t  f = {};
 
-    if (argc < 1) return MIPSU_RESULT_MISSING_ARGS;
-
-    r = mipsu_asm((size_t)argc, args, &f);
+    r = mipsu_asm(n, args, &f, c);
     if (r) return r;
 
     mipsu_dump_asm(f, c);
@@ -1137,28 +1268,44 @@ static mipsu_result_t mipsu_args_asm(int32_t argc, const char** args,
     return MIPSU_RESULT_OK;
 }
 
-static mipsu_result_t mipsu_arg_asm(const char* a, mipsu_ctx_t c) {
-    char        cp[512] = {};
-    const char* args[4] = {};
-    size_t      i, n = 0;
+static mipsu_result_t mipsu_arg_asm(const char* s, mipsu_ctx_t c) {
+    const char* a[4] = {};
+    size_t      n;
 
-    strncpy(cp, a, sizeof(cp) - 1);
+    mipsu_result_t r = mipsu_parse_asm(s, a, &n);
 
-    if (cp[sizeof(cp) - 1]) return MIPSU_RESULT_BUFF_OVERFLOW;
+    if (r) return r;
 
-    for (i = 0; cp[i]; ++i) {
+    return mipsu_args_asm(n, a, c);
+}
 
-        if (mipsu_ignore(cp[i])) continue;
+static mipsu_result_t mipsu_file_asm(mipsu_ctx_t c) {
+    const char*    a[4] = {};
+    size_t         n;
+    bool_t         s = false;
+    mipsu_result_t r;
+    mipsu_field_t  f;
 
-        args[n++] = cp + i;
+    while (fgets(mipsu_chr_buff, mipsu_chr_len, c.f)) {
 
-        while (!mipsu_ignore(cp[i]) && cp[i])
-            ++i;
+        *strchr(mipsu_chr_buff, '\n') = 0;
 
-        cp[i] = '\0';
+        if (!strlen(mipsu_chr_buff)) continue;
+
+        r = mipsu_parse_asm(mipsu_chr_buff, a, &n);
+
+        if (!r) r = mipsu_asm(n, a, &f, c);
+
+        if (r) {
+            mipsu_wrnrv(r, mipsu_chr_buff, c);
+            s = true;
+            continue;
+        }
+
+        mipsu_dump_asm(f, c);
     }
 
-    return mipsu_args_asm(n, args, c);
+    return s ? MIPSU_RESULT_SKIPPED : MIPSU_RESULT_OK;
 }
 
 static void mipsu_version() {
@@ -1180,7 +1327,7 @@ static const mipsu_cmd_t mipsu_cmdv[] = {
     },
     {
         "disasm",
-        mipsu_stdin_disasm,
+        mipsu_file_disasm,
         mipsu_arg_disasm,
         NULL,
     },
@@ -1192,71 +1339,112 @@ static const mipsu_cmd_t mipsu_cmdv[] = {
     },
     {
         "asm",
-        NULL,
+        mipsu_file_asm,
         mipsu_arg_asm,
         mipsu_args_asm,
     },
 };
+
 static const size_t mipsu_cmdc = sizeof(mipsu_cmdv) / sizeof(mipsu_cmd_t);
 
-static int mipsu_handle_flag(mipsu_ctx_t* c, const char* s) {
+static file_t* mipsu_open_file(const char* s, const char* m, mipsu_ctx_t c) {
+    file_t* f = fopen(s, m);
+
+    if (!f) mipsu_exitrv(MIPSU_RESULT_OPEN_FILE, s, c);
+
+    return f;
+}
+
+static bool_t mipsu_is_flag(const char* s, const char* f, char c) {
+    return s[1] == '-' ? !strcmp(s + 2, f) : (!s[2] && s[1] == c);
+}
+
+static bool_t mipsu_handle_flag(const char* s, mipsu_ctx_t* c) {
     mipsu_flag_entry_t e;
     size_t             j;
 
-    int shrt = s[1] != '-';
-
     for (j = 0; j < mipsu_flagc; ++j) {
         e = mipsu_flag_lut[j];
-        if ((shrt && (s[1] == e.shrt)) || (!shrt && (!strcmp(s + 2, e.name)))) {
+        if (mipsu_is_flag(s, e.name, e.shrt)) {
             mipsu_set_flag(c, e.bit);
-            return 1;
+            return true;
         }
     }
 
-    return 0;
+    return false;
 }
 
-static int32_t mipsu_handle_flags(int32_t argc, const char** argv,
-                                  const char** args, mipsu_ctx_t* c) {
-    size_t i, k = 0;
+static size_t mipsu_handle_ctx(int32_t argc, const char** argv,
+                               const char** args, mipsu_ctx_t* c) {
+    size_t i, n = 0;
 
-    for (i = 0; i < (size_t)argc; ++i)
-        if (argv[i][0] != '-' || !argv[i][1] || !mipsu_handle_flag(c, argv[i]))
-            args[k++] = argv[i];
+    c->o = stdout;
+    c->f = stdin;
 
-    return k;
+    for (i = 1; i < (size_t)argc; ++i) {
+        if (argv[i][0] != '-') {
+            args[n++] = argv[i];
+            continue;
+        }
+
+        if (!argv[i][1]) mipsu_exitr(MIPSU_RESULT_STDIN_CHAR, *c);
+
+        if (mipsu_is_flag(argv[i], "output", 'o')) {
+            c->o = mipsu_open_file(argv[++i], "w", *c);
+            mipsu_set_flag(c, MIPSU_FLAG_QUIET);
+            continue;
+        }
+        if (mipsu_is_flag(argv[i], "file", 'f')) {
+            c->f = mipsu_open_file(argv[++i], "r", *c);
+            continue;
+        }
+
+        mipsu_handle_flag(argv[i], c);
+    }
+
+    return n;
 }
 
-static void mipsu_handle_cmd(int32_t argc, const char** args, mipsu_cmd_t cmd,
-                             mipsu_ctx_t c) {
-    if (argc == 0 && cmd.no_arg) mipsu_exitr(cmd.no_arg(c), c);
-    if (argc == 1 && cmd.one_arg) mipsu_exitr(cmd.one_arg(args[0], c), c);
+static mipsu_result_t mipsu_handle_cmd(size_t n, const char** args,
+                                       mipsu_cmd_t cmd, mipsu_ctx_t c) {
 
-    if (cmd.any_arg) mipsu_exitr(cmd.any_arg(argc, args, c), c);
+    if (c.f != stdin && n) mipsu_exitr(MIPSU_RESULT_TOO_MANY_ARGS, c);
 
-    mipsu_exit(MIPSU_EXIT_USAGE, c);
+    switch (n) {
+    case 0:
+        if (cmd.from_file)
+            return cmd.from_file(c);
+        else
+            return MIPSU_RESULT_FROM_FILE;
+    case 1:
+        if (cmd.from_arg) return cmd.from_arg(args[0], c);
+    default:
+        if (cmd.from_args) return cmd.from_args(n, args, c);
+    }
+
+    return MIPSU_RESULT_BAD_ARGC;
 }
 
 int32_t main(int32_t argc, const char** argv) {
-    const char* args[argc + 1];
-    size_t      i;
+    const char* args[argc];
+    size_t      i, n;
     mipsu_ctx_t c = {};
 
-    argc = mipsu_handle_flags(argc, argv, args, &c);
+    n = mipsu_handle_ctx(argc, argv, args, &c);
 
-    if (argc < 2) {
+    if (n < 1) {
         puts(mipsu_usage);
         mipsu_exitr(MIPSU_RESULT_MISSING_ARGS, c);
     }
 
-    if (!strcmp(argv[1], "--version")) mipsu_version();
+    if (mipsu_is_flag(args[0], "version", 0)) mipsu_version();
 
-    if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) mipsu_help();
+    if (mipsu_is_flag(args[0], "help", 'h')) mipsu_help();
 
     for (i = 0; i < mipsu_cmdc; ++i)
-        if (!strcmp(args[1], mipsu_cmdv[i].name))
-            mipsu_handle_cmd(argc - 2, args + 2, mipsu_cmdv[i], c);
+        if (!strcmp(args[0], mipsu_cmdv[i].name))
+            mipsu_exitr(mipsu_handle_cmd(n - 1, args + 1, mipsu_cmdv[i], c), c);
 
     puts(mipsu_usage);
-    mipsu_exitrv(MIPSU_RESULT_BAD_CMD, argv[1], c);
+    mipsu_exitrv(MIPSU_RESULT_BAD_CMD, args[0], c);
 }

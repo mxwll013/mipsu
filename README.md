@@ -14,7 +14,7 @@ usage:
   mipsu encode -R <rs> <rt> <rd> <sh> <fn>
   mipsu encode -I <op> <rs> <rt> <imm>
   mipsu encode -J <op> <addr>
-  mipsu asm    [assembly]
+  mipsu asm    [mips]
   mipsu --version
   mipsu --help | -h
 
