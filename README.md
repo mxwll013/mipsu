@@ -31,6 +31,7 @@ flags:
   -v, --verbose   maximal output
       --no-color  plain output
   -n, --nreg      use numbers when formatting registers
+  -d, --dimm      use base 10 when formatting immediates
   -s, --strict    enable strict parsing
       --raw       handle raw binary files
 
